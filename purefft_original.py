@@ -10,10 +10,6 @@ from tqdm import tqdm
 import numpy as np
 import os
 import math
-from tinygrad import Tensor, nn as tg_nn, Device, dtypes
-
-# Enable GPU if available
-os.environ["GPU"] = "1"
 
 
 def compute_fft_chunk(args):
@@ -94,78 +90,95 @@ class PrecomputedFFTDataset(Dataset):
         return self.fft_cache[idx], self.labels[idx]
 
 
-class FFTPatternTransformer:
+class FFTPatternTransformer(torch.nn.Module):
     def __init__(self, input_dim, n_patterns=8, n_layers=2):
+        super(FFTPatternTransformer, self).__init__()
         self.freq_dim = input_dim // 2 + 1
         self.n_layers = n_layers
 
-        # Initialize pattern pool directly in frequency domain (real only)
-        t = Tensor.arange(self.freq_dim, dtype=dtypes.float32)
-        i = Tensor.arange(n_patterns, dtype=dtypes.float32).reshape(-1, 1)
-        self.pattern_pool = Tensor.cos(2 * math.pi * i * t / n_patterns) * 0.02
+        # Initialize patterns using frequency characteristics
+        patterns = torch.zeros(n_patterns, self.freq_dim)
+        for i in range(n_patterns):
+            phase = 2 * math.pi * i / n_patterns
+            t = torch.arange(self.freq_dim, dtype=torch.float32)
+            patterns[i] = torch.abs(torch.exp(1j * phase * t)) * 0.02
 
-        # Initialize layer patterns in frequency domain
-        i = Tensor.arange(n_layers, dtype=dtypes.float32).reshape(-1, 1)
-        self.layer_patterns = Tensor.cos(2 * math.pi * i * t / n_layers) * 0.02
+        self.pattern_pool = nn.Parameter(patterns)
 
-        # Class filters in frequency domain
-        i = Tensor.arange(10, dtype=dtypes.float32).reshape(-1, 1)
-        self.class_patterns = Tensor.cos(2 * math.pi * i * t / 10) * 0.02
+        # Initialize layer patterns similarly
+        layer_patterns = torch.zeros(n_layers, self.freq_dim)
+        for i in range(n_layers):
+            phase = 2 * math.pi * i / n_layers
+            t = torch.arange(self.freq_dim, dtype=torch.float32)
+            layer_patterns[i] = torch.abs(torch.exp(1j * phase * t)) * 0.02
 
-    def __call__(self, x):
-        # Input x is already in frequency domain from preprocessing (magnitude only)
-        x = Tensor(x.numpy(), dtype=dtypes.float32)  # [batch, freq_dim]
-        
+        self.layer_patterns = nn.Parameter(layer_patterns)
+
+        # Class filters like FFTMLP
+        class_filters = torch.zeros(10, self.freq_dim)
+        for i in range(10):
+            phase = 2 * math.pi * i / 10
+            t = torch.arange(self.freq_dim, dtype=torch.float32)
+            class_filters[i] = torch.abs(torch.exp(1j * phase * t)) * 0.02
+
+        self.class_patterns = nn.Parameter(class_filters)
+
+
+    def forward(self, x):
+        # x shape: [batch, freq_dim]
         for i in range(self.n_layers):
-            # Frequency domain correlation (real only)
-            pattern_scores = (self.pattern_pool * self.layer_patterns[i].reshape(1, -1)).sum(axis=1)
-            pattern_weights = pattern_scores.softmax()
+            # Pattern selection
+            pattern_scores = torch.mm(self.pattern_pool, self.layer_patterns[i].unsqueeze(1)).squeeze()
+            pattern_weights = F.softmax(pattern_scores, dim=-1)
             
-            # Weighted combination of frequency patterns
-            weighted_patterns = (self.pattern_pool * pattern_weights.reshape(-1, 1))  # [n_patterns, freq_dim]
-            x = (x.reshape(x.shape[0], 1, -1) * weighted_patterns.reshape(1, -1, self.freq_dim)).sum(axis=1)
+            # Combined pattern combination and application
+            x = (x.unsqueeze(1) * (self.pattern_pool * pattern_weights.unsqueeze(-1))).sum(1)
         
-        # Final classification using frequency domain correlation
-        class_scores = (x.reshape(x.shape[0], 1, -1) * self.class_patterns.reshape(1, 10, -1)).sum(axis=2)
+        # Classification
+        class_scores = torch.mm(x, self.class_patterns.T)
         
-        # Apply log_softmax for numerical stability
-        return class_scores.log_softmax()
+        return class_scores
 
-def train_model(model, train_loader, test_loader, epochs=10):
-    print(f"Training on {Device.DEFAULT}")
-    optim = tg_nn.optim.Adam([model.pattern_pool, model.layer_patterns, model.class_patterns], lr=0.001)
+
+def train_model(model, train_loader, test_loader, epochs=10, device="cpu"):
+    print(f"Training on {device}")
+    model = model.to(device)
+    optimizer = torch.optim.Adam(model.parameters(), lr=0.001)
+    criterion = torch.nn.CrossEntropyLoss()
+
+    torch.set_num_threads(torch.get_num_threads())
+    torch.set_float32_matmul_precision("medium")
 
     for epoch in range(epochs):
-        Tensor.training = True
+        model.train()
         start_time = time.time()
 
         for batch_idx, (data, target) in enumerate(train_loader):
-            optim.zero_grad()
-            output = model(data)  # This is now log_softmax output
-            target = Tensor(target.numpy(), dtype=dtypes.float32)
-            # NLL loss with log_softmax outputs
-            loss = output.mul(-1).gather(1, target.reshape(-1, 1)).mean()
+            data, target = data.to(device), target.to(device)
+            optimizer.zero_grad(set_to_none=True)
+            output = model(data)
+            loss = criterion(output, target)
             loss.backward()
-            optim.step()
+            optimizer.step()
 
             if batch_idx % 100 == 0:
                 print(
                     f"Train Epoch: {epoch} [{batch_idx * len(data)}/{len(train_loader.dataset)} "
-                    f"({100. * batch_idx / len(train_loader):.0f}%)]\tLoss: {loss.numpy():.6f}"
+                    f"({100. * batch_idx / len(train_loader):.0f}%)]\tLoss: {loss.item():.6f}"
                 )
 
-        Tensor.training = False
+        model.eval()
         correct = 0
-        total = 0
-        for data, target in test_loader:
-            output = model(data)  # log_softmax output
-            pred = output.argmax(axis=1)
-            correct += (pred.numpy() == target.numpy()).sum()
-            total += len(target)
+        with torch.no_grad():
+            for data, target in test_loader:
+                data, target = data.to(device), target.to(device)
+                output = model(data)
+                pred = output.argmax(dim=1)
+                correct += pred.eq(target).sum().item()
 
-        accuracy = 100.0 * correct / total
+        accuracy = 100.0 * correct / len(test_loader.dataset)
         print(
-            f"Epoch {epoch}: Accuracy: {correct}/{total} "
+            f"Epoch {epoch}: Accuracy: {correct}/{len(test_loader.dataset)} "
             f"({accuracy:.2f}%), Time: {time.time() - start_time:.2f}s"
         )
 
@@ -189,18 +202,20 @@ def main():
     train_dataset = PrecomputedFFTDataset(train_dataset)
     test_dataset = PrecomputedFFTDataset(test_dataset)
 
+    # Maximize data loading parallelization
+    num_workers = min(8, torch.get_num_threads())
     train_loader = DataLoader(
         train_dataset,
         batch_size=batch_size,
         shuffle=True,
-        num_workers=4,
+        num_workers=num_workers,
         pin_memory=True,
         persistent_workers=True,
     )
     test_loader = DataLoader(
         test_dataset,
         batch_size=batch_size,
-        num_workers=4,
+        num_workers=num_workers,
         pin_memory=True,
         persistent_workers=True,
     )
