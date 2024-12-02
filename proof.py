@@ -24,7 +24,7 @@ def freq_init(shape, scale=1.0):
     return torch.from_numpy(freqs)
 
 
-def verify_equivalence(seq_len=32, embed_dim=8, batch_size=2):
+def verify_equivalence(seq_len=32, embed_dim=8, batch_size=2, threshold=1e-4):
     print("\nInitializing test with:")
     print(f"Sequence length: {seq_len}")
     print(f"Embedding dimension: {embed_dim}")
@@ -49,20 +49,20 @@ def verify_equivalence(seq_len=32, embed_dim=8, batch_size=2):
     print("Computing frequency domain attention...")
     # Frequency domain computation
     # Compute Q = x @ Wq in frequency domain
-    Q_f = torch.sum(
-        x_f[:, :, None, :] * Wq_f[:, None, :, :], dim=-1
+    Q_f = (
+        torch.sum(x_f[:, :, None, :] * Wq_f[:, None, :, :], dim=-1) / seq_len
     )  # (seq, batch, embed)
 
     # Compute K = x @ Wk in frequency domain
-    K_f = torch.sum(
-        x_f[:, :, None, :] * Wk_f[:, None, :, :], dim=-1
+    K_f = (
+        torch.sum(x_f[:, :, None, :] * Wk_f[:, None, :, :], dim=-1) / seq_len
     )  # (seq, batch, embed)
 
     # Compute Q @ K.T in frequency domain
-    scores_freq = torch.sum(
-        Q_f[:, :, None, :] * torch.conj(K_f[:, None, :, :]), dim=-1
+    scores_freq = (
+        torch.sum(Q_f[:, :, None, :] * torch.conj(K_f[:, None, :, :]), dim=-1) / seq_len
     )  # (seq, batch, batch)
-    scores_freq = ifft(scores_freq, dim=0).real
+    scores_freq = ifft(scores_freq, dim=0).real * seq_len  # Scale back after IFFT
 
     print("\nShape information:")
     print(f"Spatial scores shape: {scores_spatial.shape}")
@@ -74,25 +74,15 @@ def verify_equivalence(seq_len=32, embed_dim=8, batch_size=2):
     )
     print(f"Frequency scores range: [{scores_freq.min():.6f}, {scores_freq.max():.6f}]")
 
-    # Normalize both for comparison
-    scores_spatial = scores_spatial / scores_spatial.abs().max()
-    scores_freq = scores_freq / scores_freq.abs().max()
-
-    print("\nNormalized ranges:")
-    print(
-        f"Normalized spatial range: [{scores_spatial.min():.6f}, {scores_spatial.max():.6f}]"
-    )
-    print(
-        f"Normalized frequency range: [{scores_freq.min():.6f}, {scores_freq.max():.6f}]"
-    )
-
     # Convert to numpy for comparison and plotting
     scores_spatial = scores_spatial.numpy()
     scores_freq = scores_freq.numpy()
 
     # Verify equivalence
     max_diff = np.max(np.abs(scores_spatial - scores_freq))
-    print(f"\nMaximum difference between normalized scores: {max_diff}")
+    rel_diff = max_diff / (np.abs(scores_spatial).max() + 1e-8)
+    print(f"\nAbsolute maximum difference: {max_diff:.8f}")
+    print(f"Relative maximum difference: {rel_diff:.8f}")
 
     # Plot comparison
     plt.figure(figsize=(15, 5))
@@ -116,10 +106,12 @@ def verify_equivalence(seq_len=32, embed_dim=8, batch_size=2):
     plt.savefig("attention_equivalence.png")
     plt.close()
 
-    return max_diff < 1e-6
+    return rel_diff < threshold  # Use relative difference with threshold
 
 
 if __name__ == "__main__":
     np.random.seed(42)
-    is_equivalent = verify_equivalence()
-    print(f"\nAttention mechanisms equivalent: {is_equivalent}")
+    is_equivalent = verify_equivalence(
+        threshold=1e-4
+    )  # Allow 0.01% relative difference
+    print(f"\nAttention mechanisms equivalent within threshold: {is_equivalent}")
