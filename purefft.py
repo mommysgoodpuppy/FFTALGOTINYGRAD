@@ -94,6 +94,32 @@ class PrecomputedFFTDataset(Dataset):
         return self.fft_cache[idx], self.labels[idx]
 
 
+def pure_forward(x, pattern_pool, layer_patterns, class_patterns, n_layers, freq_dim):
+    # Forward pass - all pure operations
+    curr = x  # [batch, freq]
+    batch_size = curr.shape[0]
+    
+    for i in range(n_layers):
+        # Pattern selection - [n_patterns]
+        pattern_scores = (pattern_pool * layer_patterns[i]).sum(axis=1)
+        pattern_weights = pattern_scores.softmax()
+        
+        # Expand patterns to match batch - [n_patterns, batch, freq]
+        weighted_patterns = (pattern_pool.reshape(-1, 1, freq_dim) * 
+                           pattern_weights.reshape(-1, 1, 1))
+        
+        # Expand curr to match patterns - [1, batch, freq]
+        curr_expanded = curr.reshape(1, batch_size, freq_dim)
+        
+        # Multiply and sum - [batch, freq]
+        curr = (curr_expanded * weighted_patterns).sum(axis=0)
+    
+    # Classification - expand for class dimension
+    curr_expanded = curr.reshape(batch_size, 1, freq_dim)
+    class_scores = (curr_expanded * class_patterns.reshape(1, 10, -1)).sum(axis=2)
+    return class_scores.log_softmax()
+
+
 class FFTPatternTransformer:
     def __init__(self, input_dim, n_patterns=8, n_layers=2):
         self.freq_dim = input_dim // 2 + 1
@@ -113,23 +139,10 @@ class FFTPatternTransformer:
         self.class_patterns = Tensor.cos(2 * math.pi * i * t / 10) * 0.02
 
     def __call__(self, x):
-        # Input x is already in frequency domain from preprocessing (magnitude only)
-        x = Tensor(x.numpy(), dtype=dtypes.float32)  # [batch, freq_dim]
-        
-        for i in range(self.n_layers):
-            # Frequency domain correlation (real only)
-            pattern_scores = (self.pattern_pool * self.layer_patterns[i].reshape(1, -1)).sum(axis=1)
-            pattern_weights = pattern_scores.softmax()
-            
-            # Weighted combination of frequency patterns
-            weighted_patterns = (self.pattern_pool * pattern_weights.reshape(-1, 1))  # [n_patterns, freq_dim]
-            x = (x.reshape(x.shape[0], 1, -1) * weighted_patterns.reshape(1, -1, self.freq_dim)).sum(axis=1)
-        
-        # Final classification using frequency domain correlation
-        class_scores = (x.reshape(x.shape[0], 1, -1) * self.class_patterns.reshape(1, 10, -1)).sum(axis=2)
-        
-        # Apply log_softmax for numerical stability
-        return class_scores.log_softmax()
+        return pure_forward(Tensor(x.numpy(), dtype=dtypes.float32), 
+                          self.pattern_pool, self.layer_patterns, self.class_patterns,
+                          self.n_layers, self.freq_dim)
+
 
 def train_model(model, train_loader, test_loader, epochs=10):
     print(f"Training on {Device.DEFAULT}")
